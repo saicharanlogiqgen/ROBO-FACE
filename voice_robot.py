@@ -4,10 +4,9 @@ Raspberry Pi SAFE + ALSA SAFE + GROQ + PYTTSX3 SAFE
 FINAL FIX: WAV -> PCM16 for pygame compatibility
 """
 
-import os, sys, time, threading, pygame, re, tempfile, wave
+import os, sys, time, threading, pygame, re, tempfile, wave, io
 import numpy as np
 import sounddevice as sd
-import soundfile as sf
 import cv2
 import random
 from openai import OpenAI
@@ -22,6 +21,16 @@ from groq import Groq
 load_dotenv()
 
 # ================= API CONFIG =================
+
+# ---- LOGGING ----
+# Set DEBUG=1 to enable diagnostic prints.
+DEBUG = os.getenv("DEBUG", "0").strip() in {"1", "true", "True", "yes", "YES"}
+
+
+def dprint(*args, **kwargs):
+    if DEBUG:
+        print(*args, **kwargs)
+
 
 # ---- GROQ ----
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "api_key")
@@ -40,13 +49,28 @@ if GROQ_API_KEY == "key" or not GROQ_API_KEY:
 
 # ---------------- INIT ----------------
 pygame.init()
-pygame.mixer.init(frequency=44100, size=-16, channels=1, buffer=1024)
+# Stereo + larger buffer — helps MP3 playback on Raspberry Pi
+pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=4096)
+
+
+def _pygame_supports_mp3_bytesio():
+    """pygame.mixer.music.load(BytesIO, 'mp3') needs pygame 2.1.3+."""
+    m = re.match(r"(\d+)\.(\d+)\.(\d+)", str(getattr(pygame.version, "ver", "")))
+    if not m:
+        return False
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) >= (2, 1, 3)
 
 # ---------------- AUDIO CONFIG ----------------
-MAX_RECORDING = 4.5
-CHUNK_TIME = 0.2
-SILENCE_TIME = 0.4
-VAD_THRESHOLD = 0.06
+MAX_RECORDING = 4.5  # hard ceiling (seconds)
+CHUNK_TIME = 0.1  # smaller chunks = faster reaction (was 0.2)
+SILENCE_TIME = 0.25  # cut off sooner after speech ends (was 0.4)
+VAD_THRESHOLD = 0.06  # fallback — adaptive floor replaces it in practice
+
+# ---- Smarter VAD config ----
+VAD_CALIBRATION_CHUNKS = 8  # first 0.8s used to measure room noise floor
+VAD_SNR_RATIO = 4.0  # speech must be 4× louder than noise floor to count
+VAD_MIN_SPEECH_CHUNKS = 3  # ignore blips shorter than 3 chunks (0.3s)
+VAD_HANGOVER_CHUNKS = 3  # stay "active" for 3 chunks after energy drops (0.3s)
 
 # ---------------- MIC SAFE CONFIG ----------------
 def get_safe_input_config():
@@ -59,7 +83,7 @@ def get_safe_input_config():
                     samplerate=int(d["default_samplerate"]),
                     channels=1
                 )
-                print(f"✓ Selected Mic {i}: {d['name']} @ {int(d['default_samplerate'])} Hz")
+                dprint(f"✓ Selected Mic {i}: {d['name']} @ {int(d['default_samplerate'])} Hz")
                 return i, int(d["default_samplerate"])
             except Exception:
                 continue
@@ -77,6 +101,7 @@ class VoiceRobot:
 
         self.busy = False
         self.speaking = False
+        self._prefetched_audio = None
 
         self.groq = Groq(api_key=GROQ_API_KEY)
         
@@ -92,12 +117,70 @@ class VoiceRobot:
         self.camera = None
         self._init_face_detector()
 
-    # ---------------- RECORD AUDIO ----------------
+    # ---------------- RECORD AUDIO (smart VAD) ----------------
     def record_audio(self):
-        self.robot.set_expression("thinking")
-        audio, silence, started, elapsed = [], 0, False, 0
+        """
+        Smarter VAD with:
+          - RMS energy instead of peak amplitude (noise-resistant)
+          - Adaptive noise floor (auto-calibrates to the room)
+          - Hangover logic (short silences mid-word don't cut off early)
+          - Dynamic silence timeout (short responses cut off faster)
+          - Minimum speech gate (ignores sub-0.3s noise bursts)
+        """
+        return self._record_with_smart_vad(prefetch=False)
+
+    def _record_with_smart_vad(self, prefetch=False):
+        """Shared smart VAD for normal recording and pipeline prefetch."""
+        if not prefetch:
+            self.robot.set_expression("thinking")
+        else:
+            time.sleep(0.2)
+
+        audio_chunks = []
+        elapsed = 0.0
+        speech_active = False
+        speech_started = False
+        silence_time = 0.0
+        noise_floor = VAD_THRESHOLD
+        hangover = 0
+        speech_chunk_count = 0
+        peak_energy = 0.0
+
+        calibration_frames = []
+        for _ in range(VAD_CALIBRATION_CHUNKS):
+            if prefetch and not pygame.mixer.music.get_busy() and elapsed > 0.5:
+                break
+            chunk = sd.rec(
+                int(CHUNK_TIME * MIC_SR),
+                samplerate=MIC_SR,
+                channels=1,
+                device=MIC_DEVICE,
+                dtype="float32",
+                blocking=True
+            ).flatten()
+            calibration_frames.append(chunk)
+            audio_chunks.append(chunk)
+            elapsed += CHUNK_TIME
+
+        if not calibration_frames:
+            if not prefetch:
+                self.robot.set_expression("happy")
+            return None
+
+        cal_audio = np.concatenate(calibration_frames)
+        noise_floor = max(
+            float(np.sqrt(np.mean(cal_audio ** 2))) * VAD_SNR_RATIO,
+            VAD_THRESHOLD,
+        )
+        if not prefetch:
+            dprint(
+                f"🎙️  Noise floor: {noise_floor:.4f}  (threshold × {VAD_SNR_RATIO})"
+            )
 
         while elapsed < MAX_RECORDING:
+            if prefetch and not pygame.mixer.music.get_busy() and elapsed > 0.5:
+                break
+
             chunk = sd.rec(
                 int(CHUNK_TIME * MIC_SR),
                 samplerate=MIC_SR,
@@ -107,43 +190,75 @@ class VoiceRobot:
                 blocking=True
             ).flatten()
 
-            amp = np.max(np.abs(chunk))
-            audio.append(chunk)
+            audio_chunks.append(chunk)
             elapsed += CHUNK_TIME
 
-            if amp > VAD_THRESHOLD:
-                started, silence = True, 0
-            elif started:
-                silence += CHUNK_TIME
+            rms = float(np.sqrt(np.mean(chunk ** 2)))
+            is_speech = rms > noise_floor
 
-            if started and silence >= SILENCE_TIME:
-                break
+            if is_speech:
+                peak_energy = max(peak_energy, rms)
+                if not speech_started:
+                    speech_started = True
+                    speech_active = True
+                    if not prefetch:
+                        dprint("🗣️  Speech detected")
+                hangover = VAD_HANGOVER_CHUNKS
+                silence_time = 0.0
+                speech_chunk_count += 1
 
-        self.robot.set_expression("happy")
-        return np.concatenate(audio) if started else None
+            else:
+                if speech_started:
+                    if hangover > 0:
+                        hangover -= 1
+                        speech_chunk_count += 1
+                    else:
+                        speech_active = False
+                        silence_time += CHUNK_TIME
+
+            if speech_started and not speech_active:
+                dynamic_silence = SILENCE_TIME
+                if speech_chunk_count > 15:
+                    dynamic_silence = 0.35
+                if silence_time >= dynamic_silence:
+                    if not prefetch:
+                        dprint(
+                            f"✂️  Cut off after {silence_time:.2f}s silence  "
+                            f"({speech_chunk_count} speech chunks)"
+                        )
+                    break
+
+        if not prefetch:
+            self.robot.set_expression("happy")
+
+        if not speech_started or speech_chunk_count < VAD_MIN_SPEECH_CHUNKS:
+            if not prefetch:
+                dprint("🔇 Too short / no speech detected — ignoring")
+            return None
+
+        return np.concatenate(audio_chunks)
 
     # ---------------- STT ----------------
     def speech_to_text(self, audio):
         audio16 = (audio * 32767).astype(np.int16)
-        wav_path = tempfile.mktemp(".wav")
 
-        with wave.open(wav_path, "wb") as wf:
+        # Build WAV in memory — no tempfile, no disk write
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(MIC_SR)
             wf.writeframes(audio16.tobytes())
+        buf.seek(0)
 
-        # Use Groq's Whisper API for speech-to-text
-        with open(wav_path, "rb") as f:
-            transcription = self.stt_client.audio.transcriptions.create(
-                file=f,
-                model=GROQ_STT_MODEL
-            )
-        text = transcription.text.strip()
+        # Groq's OpenAI-compatible client needs a file-like object with a .name
+        buf.name = "audio.wav"
 
-        os.unlink(wav_path)
-
-        return text
+        transcription = self.stt_client.audio.transcriptions.create(
+            file=buf,
+            model=GROQ_STT_MODEL
+        )
+        return transcription.text.strip()
 
     # ---------------- LLM ----------------
     def reply(self, text):
@@ -176,11 +291,13 @@ class VoiceRobot:
 
 
     def speak(self, text):
-        def run():
-            text_clean = self._text_for_tts(text)
-            if not text_clean:
-                return
+        text_clean = self._text_for_tts(text)
+        if not text_clean:
+            return
 
+        self.speaking = True
+
+        def run():
             async def _stream():
                 communicate = edge_tts.Communicate(
                     text_clean,
@@ -189,60 +306,55 @@ class VoiceRobot:
                     volume="+0%"
                 )
 
-                # Collect all audio chunks first
-                audio_chunks = []
+                mp3_buf = io.BytesIO()
                 async for chunk in communicate.stream():
                     if chunk["type"] == "audio":
-                        audio_chunks.append(chunk["data"])
+                        mp3_buf.write(chunk["data"])
 
-                if not audio_chunks:
+                if mp3_buf.tell() == 0:
+                    self.speaking = False
                     return
 
-                # Write collected MP3 chunks to temp file
-                mp3_path = tempfile.mktemp(".mp3")
-                wav_pcm = tempfile.mktemp(".wav")
+                # Lip sync duration: edge_tts ~24 kbps CBR MP3 (good enough for phoneme timing)
+                mp3_bytes = mp3_buf.tell()
+                mp3_buf.seek(0)
+                estimated_duration = (mp3_bytes * 8) / 24_000
+                estimated_duration = max(1.0, estimated_duration)
+
+                text_length = len(text_clean)
+                frames_per_char = max(
+                    4, min(12, int((estimated_duration / text_length) * FPS))
+                ) if text_length > 0 else 6
+
+                self.robot.speak_text(text_clean, phoneme_duration=frames_per_char)
+                self.robot.viseme_timer = 999
+                self.robot.viseme_duration = 0
+                self.robot.phoneme_queue_index = 0
+                self.robot.enable_lip_sync(True)
 
                 try:
-                    with open(mp3_path, "wb") as f:
-                        for chunk in audio_chunks:
-                            f.write(chunk)
-
-                    # Convert MP3 → PCM WAV
-                    import subprocess
-                    subprocess.run(
-                        ["ffmpeg", "-y", "-i", mp3_path, "-ar", "44100",
-                         "-ac", "1", "-sample_fmt", "s16", wav_pcm],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                    )
-                    os.unlink(mp3_path)
-
-                    audio_data, sr = sf.read(wav_pcm)
-                    audio_duration = len(audio_data) / sr
-                    text_length = len(text_clean)
-
-                    frames_per_char = max(4, min(12, int((audio_duration / text_length) * FPS))) if text_length > 0 else 6
-
-                    self.robot.speak_text(text_clean, phoneme_duration=frames_per_char)
-                    self.robot.viseme_timer = 999
-                    self.robot.viseme_duration = 0
-                    self.robot.phoneme_queue_index = 0
-                    self.robot.enable_lip_sync(True)
-
-                    pygame.mixer.music.load(wav_pcm)
-                    pygame.mixer.music.play()
-
-                    while pygame.mixer.music.get_busy():
-                        await asyncio.sleep(0.01)
-
+                    if _pygame_supports_mp3_bytesio():
+                        pygame.mixer.music.load(mp3_buf, "mp3")
+                        pygame.mixer.music.play()
+                        while pygame.mixer.music.get_busy():
+                            await asyncio.sleep(0.01)
+                    else:
+                        mp3_path = tempfile.mktemp(".mp3")
+                        try:
+                            with open(mp3_path, "wb") as f:
+                                f.write(mp3_buf.read())
+                            pygame.mixer.music.load(mp3_path)
+                            pygame.mixer.music.play()
+                            while pygame.mixer.music.get_busy():
+                                await asyncio.sleep(0.01)
+                        finally:
+                            try:
+                                os.unlink(mp3_path)
+                            except OSError:
+                                pass
                 finally:
                     self.robot.enable_lip_sync(False)
-                    self.busy = False
-                    for f in [wav_pcm]:
-                        try:
-                            if os.path.exists(f):
-                                os.unlink(f)
-                        except:
-                            pass
+                    self.speaking = False
 
             asyncio.run(_stream())
 
@@ -256,19 +368,19 @@ class VoiceRobot:
             local_cascade = "haarcascade_frontalface_default.xml"
             if os.path.exists(local_cascade):
                 cascade_path = local_cascade
-                print(f"Using local cascade file: {cascade_path}")
+                dprint(f"Using local cascade file: {cascade_path}")
             else:
                 # Use OpenCV's built-in cascade
                 cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-                print(f"Using OpenCV cascade: {cascade_path}")
+                dprint(f"Using OpenCV cascade: {cascade_path}")
             
             self.face_cascade = cv2.CascadeClassifier(cascade_path)
             if self.face_cascade.empty():
                 raise Exception(f"Could not load face cascade from {cascade_path}")
-            print("✓ Face detector initialized")
+            dprint("✓ Face detector initialized")
         except Exception as e:
-            print(f"✗ Error initializing face detector: {e}")
-            print("   Make sure OpenCV is properly installed or haarcascade file exists")
+            dprint(f"✗ Error initializing face detector: {e}")
+            dprint("   Make sure OpenCV is properly installed or haarcascade file exists")
             self.face_cascade = None
     
     def detect_face(self):
@@ -279,7 +391,7 @@ class VoiceRobot:
         try:
             # Open camera if not already open
             if self.camera is None:
-                print("Opening camera...")
+                dprint("Opening camera...")
                 # On Windows, use DirectShow backend so camera doesn't hang with pygame window
                 if sys.platform == "win32":
                     self.camera = cv2.VideoCapture(0, cv2.CAP_DSHOW)
@@ -291,7 +403,7 @@ class VoiceRobot:
                 if not self.camera.isOpened():
                     # Try alternative camera indices (same backend on Windows)
                     for i in range(1, 3):
-                        print(f"Trying camera {i}...")
+                        dprint(f"Trying camera {i}...")
                         if sys.platform == "win32":
                             self.camera = cv2.VideoCapture(i, cv2.CAP_DSHOW)
                         else:
@@ -348,10 +460,10 @@ class VoiceRobot:
                 return self._get_multiple_faces_comment(len(faces))
                 
         except cv2.error as e:
-            print(f"OpenCV error: {e}")
+            dprint(f"OpenCV error: {e}")
             return "Camera error! Make sure your camera is working properly."
         except Exception as e:
-            print(f"Face detection error: {e}")
+            dprint(f"Face detection error: {e}")
             import traceback
             traceback.print_exc()
             return "Whoops! Something went wrong with my vision. Try again!"
@@ -443,7 +555,7 @@ class VoiceRobot:
             print(f"🤖 Face Detection: {comment}")
             self.speak(comment)
         except Exception as e:
-            print(f"Face detection error: {e}")
+            dprint(f"Face detection error: {e}")
             error_msg = "Oops! Something went wrong with face detection. Try again!"
             self.speak(error_msg)
         finally:
@@ -457,30 +569,108 @@ class VoiceRobot:
 
     # ---------------- TALK FLOW ----------------
     def talk(self):
+        """Entry point: press T to start a turn. Non-blocking."""
         if self.busy:
             return
+        threading.Thread(target=self._pipeline_run, daemon=True).start()
 
-        def run():
-            try:
-                self.busy = True
-                audio = self.record_audio()
-                if audio is None:
-                    self.busy = False
-                    return
+    def _pipeline_run(self):
+        """
+        Pipelined turn:
+          1. Record audio (blocking mic capture)
+          2. STT then LLM (each in executor; LLM starts immediately after STT)
+          3. Speak reply
+          4. While speaking: pre-record the NEXT utterance in a background thread
+          5. If pre-recorded audio exists, next talk() skips mic wait
+        """
+        asyncio.run(self._async_pipeline())
 
-                text = self.speech_to_text(audio)
-                print(f"You: {text}")
+    async def _async_pipeline(self):
+        loop = asyncio.get_event_loop()
 
-                reply = self.reply(text)
-                print(f"AI: {reply}")
+        audio = getattr(self, "_prefetched_audio", None)
+        self._prefetched_audio = None
 
-                self.speak(reply)
+        try:
+            self.busy = True
 
-            except Exception as e:
-                print("Talk error:", e)
-                self.busy = False
+            if audio is None:
+                self.robot.set_expression("thinking")
+                audio = await loop.run_in_executor(None, self.record_audio)
 
-        threading.Thread(target=run, daemon=True).start()
+            if audio is None:
+                dprint("No speech detected.")
+                return
+
+            dprint("🎤 Transcribing...")
+            text = await loop.run_in_executor(None, self.speech_to_text, audio)
+            if not text:
+                dprint("Empty transcription, skipping.")
+                return
+            print(f"You: {text}")
+
+            dprint("🤖 Thinking...")
+            self.robot.set_expression("thinking")
+            reply = await loop.run_in_executor(None, self.reply, text)
+            if not reply:
+                return
+            print(f"AI: {reply}")
+
+            self.speak(reply)
+
+            await asyncio.sleep(0.3)
+
+            dprint("👂 Pre-recording next turn while speaking...")
+            prefetched = await loop.run_in_executor(None, self._prefetch_audio)
+            self._prefetched_audio = prefetched
+
+            while pygame.mixer.music.get_busy():
+                await asyncio.sleep(0.05)
+
+        except Exception as e:
+            dprint(f"Pipeline error: {e}")
+        finally:
+            self.busy = False
+
+    def _prefetch_audio(self):
+        """
+        Record audio during the robot's speech window.
+        Returns numpy audio array or None (same contract as record_audio).
+        Stops early if speech ends.
+        """
+        time.sleep(0.2)
+
+        audio, silence, started, elapsed = [], 0, False, 0
+
+        while elapsed < MAX_RECORDING:
+            if not pygame.mixer.music.get_busy() and elapsed > 0.5:
+                break
+
+            chunk = sd.rec(
+                int(CHUNK_TIME * MIC_SR),
+                samplerate=MIC_SR,
+                channels=1,
+                device=MIC_DEVICE,
+                dtype="float32",
+                blocking=True
+            ).flatten()
+
+            amp = np.max(np.abs(chunk))
+            audio.append(chunk)
+            elapsed += CHUNK_TIME
+
+            if amp > VAD_THRESHOLD:
+                started, silence = True, 0
+            elif started:
+                silence += CHUNK_TIME
+
+            if started and silence >= SILENCE_TIME:
+                break
+
+        if started and len(audio) > 0:
+            dprint("✓ Pre-recorded speech ready.")
+            return np.concatenate(audio)
+        return None
 
 # ---------------- MAIN ----------------
 def main():

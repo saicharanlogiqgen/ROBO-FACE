@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# local data / outputs
+faces_db.pkl
+ar_shot_*.jpg
+*.jpg
+*.png
+
+# editor/OS
+.vscode/
+Thumbs.db
+desktop.ini
+
